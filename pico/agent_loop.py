@@ -13,14 +13,22 @@ class AgentLoop:
 
     def run(self, user_message):
         agent = self.agent
+        # 记录本轮 run 的起始时间，用于最后统计总耗时
         run_started_at = time.monotonic()
+        # [1] 把当前请求写入 memory 的任务摘要，供后续 prompt 组装时引用
         agent.memory.set_task_summary(user_message)
+        # [2] 把用户消息写进 session history（role: user），每轮 prompt 都会带上
         agent.record({"role": "user", "content": user_message, "created_at": now()})
 
+        # [3] 创建 TaskState，一个 run_id 绑定一个 task_id，一次请求 = 一条独立 run
         task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
+        # [4] 标记恢复状态（新 run 为 no-checkpoint，恢复时为 full-valid / partial-stale）
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        # [5] 挂到 agent 上，后续主循环每轮都读写它
         agent.current_task_state = task_state
+        # [6] 在 .pico/runs/<run_id>/ 下创建本轮目录
         agent.current_run_dir = agent.run_store.start_run(task_state)
+        # [7] 追加第一条 trace 事件，标记 run 正式开始
         agent.emit_trace(
             task_state,
             "run_started",
@@ -40,20 +48,30 @@ class AgentLoop:
         # 3. 行动：如果是工具调用，就执行工具
         # 4. 记录：把结果写回 history / task_state / trace / memory
         # 然后进入下一轮，直到停机条件满足
+        # ================================================================
+        # 主循环：感知 → 决策 → 行动 → 记录
+        # 两个退出条件：工具步数用尽（too many actions）或重试次数用尽（too many malformed responses）
+        # ================================================================
         while tool_steps < agent.max_steps and attempts < max_attempts:
-            attempts += 1
-            task_state.record_attempt()
-            agent.run_store.write_task_state(task_state)
+            # ---------- 阶段一：感知 ----------
+            attempts += 1                    # 本轮模型调用计数 +1
+            task_state.record_attempt()      # 把 attempt 计数同步到 TaskState
+            agent.run_store.write_task_state(task_state)  # 写出 task_state.json，让外部看到进度
+
             prompt_started_at = time.monotonic()
+            # 重建 prompt：history + memory + workspace 每轮都可能变，所以必须重新投影
             prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
             agent.emit_trace(
                 task_state,
                 "prompt_built",
                 {
-                    "prompt_metadata": prompt_metadata,
+                    "prompt_metadata": prompt_metadata,  # 记录这轮 prompt 的"成分表"
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
+
+            # ---------- 检查点预处理：在调模型之前检查三种异常 ----------
+            # 条件1：从检查点恢复后，文件摘要过期了
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
                 agent.run_store.write_task_state(task_state)
@@ -65,6 +83,7 @@ class AgentLoop:
                         "trigger": "freshness_mismatch",
                     },
                 )
+            # 条件2：换机器/换用户了，仓库身份不匹配
             elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
                 agent.emit_trace(
                     task_state,
@@ -83,6 +102,7 @@ class AgentLoop:
                         "trigger": "workspace_mismatch",
                     },
                 )
+            # 条件3：prompt 超预算，主动裁减了一部分内容（用 elif 是互斥的，但 budget_reductions 和上面条件可能同时发生，所以用独立的 if）
             if prompt_metadata.get("budget_reductions"):
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="context_reduction")
                 agent.run_store.write_task_state(task_state)
@@ -94,6 +114,9 @@ class AgentLoop:
                         "trigger": "context_reduction",
                     },
                 )
+
+            # ---------- 阶段二：决策（调模型） ----------
+            # 记下"准备调模型了"，含当前 attempts / tool_steps / cache key
             agent.emit_trace(
                 task_state,
                 "model_requested",
@@ -103,12 +126,15 @@ class AgentLoop:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
+
+            # 缓存策略：只有后端明确支持 prompt cache 时才传 key
             prompt_cache_key = None
             prompt_cache_retention = None
             if getattr(agent.model_client, "supports_prompt_cache", False):
-                # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
+
+            # 真正调模型，拿回原始文本 raw
             model_started_at = time.monotonic()
             raw = agent.model_client.complete(
                 prompt,
@@ -116,13 +142,15 @@ class AgentLoop:
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
             )
+
+            # 把模型后端返回的 usage / cache 统计合并到 prompt_metadata，方便统一写入 report 和 trace
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
-                # 把后端返回的 usage/cache 统计并回 prompt_metadata，
-                # 方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
             agent.last_prompt_metadata = prompt_metadata
+
+            # 解析模型输出：tool（要调工具）/ final（最终答案）/ retry（格式不对）
             kind, payload = agent.parse(raw)
             agent.emit_trace(
                 task_state,
@@ -134,51 +162,54 @@ class AgentLoop:
                 },
             )
 
+            # ================================================================
+            # 分支 A：模型要调工具 → 执行 + 落证据 → 回到循环顶部
+            # ================================================================
             if kind == "tool":
-                tool_steps += 1
+                tool_steps += 1                   # 工具步数 +1（只在真正执行时计数）
                 name = payload.get("name", "")
                 args = payload.get("args", {})
-                task_state.record_tool(name)
+                task_state.record_tool(name)      # 更新 last_tool 并累加 tool_steps
+
                 tool_started_at = time.monotonic()
-                tool_result = agent.execute_tool(name, args)
+                tool_result = agent.execute_tool(name, args)  # 闸口：校验 → 审批 → 执行
                 result = tool_result.content
-                agent.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
+                # 三处落盘，同一份结果三种视角：
+                # ① record → session history：完整结果，给模型下轮看
+                agent.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
+                # ② write_task_state → task_state.json：只更新计数（tool_steps / last_tool），给监控看
                 agent.run_store.write_task_state(task_state)
+                # ③ emit_trace → trace.jsonl：裁剪后摘要 + 耗时 + 工具元数据，给人排错看
                 agent.emit_trace(
-                    task_state,
-                    "tool_executed",
+                    task_state, "tool_executed",
                     {
-                        "name": name,
-                        "args": args,
-                        "result": clip(result, 500),
+                        "name": name, "args": args,
+                        "result": clip(result, 500),  # trace 里裁剪到 500 字符，完整结果在 history 里
                         "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(tool_result.metadata or {}),
+                        **dict(tool_result.metadata or {}),  # 工具返回的安全级别、错误码等
                     },
                 )
+                # 每次工具执行后都建一个检查点，方便中断恢复
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
+                    task_state, "checkpoint_created",
+                    {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "tool_executed"},
                 )
-                continue
+                continue  # 回到循环顶部，下一轮 prompt 会带上工具结果
 
+            # ================================================================
+            # 分支 B：模型输出格式不合法 → 写重试提示 → 回到循环顶部
+            # ================================================================
             if kind == "retry":
+                # payload 是 retry_notice 生成的提示文本，写进 history 让模型下轮看到
                 agent.record({"role": "assistant", "content": payload, "created_at": now()})
                 agent.run_store.write_task_state(task_state)
-                continue
+                continue  # 不做任何工具动作，直接进下一轮
+
+            # ================================================================
+            # 分支 C：模型给出最终答案 → 收尾 + 落盘 → return
+            # ================================================================
 
             final = (payload or raw).strip()
             agent.record({"role": "assistant", "content": final, "created_at": now()})

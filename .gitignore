@@ -36,6 +36,9 @@ artifacts/
 release/
 readme_intro_locked/
 
+# IDE
+.idea/
+
 # Local secrets and provider configuration
 .env
 .env.*
@@ -50,6 +53,8 @@ docs/*
 
 # OS files
 .DS_Store
+__MACOSX/
+._*
 
 # Packaging metadata
 pico.egg-info/
