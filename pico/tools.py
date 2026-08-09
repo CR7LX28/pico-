@@ -84,18 +84,24 @@ def tool_example(name):
 
 
 def validate_tool(context, name, args):
+    # 统一参数校验入口：按工具名分发，每个工具单独检查自己的参数。
+    # 合法就 return，不合法就 raise ValueError（被 tool_executor.py 的 try/except 接住）。
+    # 注意：所有文件类工具都会调 context.path()，这步自带路径逃逸检查（commonpath 比对）。
     args = args or {}
 
     if name == "list_files":
+        # path 默认 "."（仓库根目录），必须解析成真实目录
         path = context.path(args.get("path", "."))
         if not path.is_dir():
             raise ValueError("path is not a directory")
         return
 
     if name == "read_file":
+        # path 必须是真实文件（不能是目录）
         path = context.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
+        # 行号范围：start 必须 >=1，end 必须 >= start（默认 1~200 行）
         start = int(args.get("start", 1))
         end = int(args.get("end", 200))
         if start < 1 or end < start:
@@ -103,25 +109,31 @@ def validate_tool(context, name, args):
         return
 
     if name == "search":
+        # pattern 不能为空（搜空字符串没意义）
         pattern = str(args.get("pattern", "")).strip()
         if not pattern:
             raise ValueError("pattern must not be empty")
+        # 这里调 context.path 只是为了触发路径逃逸检查，不存返回值
         context.path(args.get("path", "."))
         return
 
     if name == "run_shell":
+        # command 不能为空
         command = str(args.get("command", "")).strip()
         if not command:
             raise ValueError("command must not be empty")
+        # timeout 默认 20 秒，必须在 1~120 秒之间
         timeout = int(args.get("timeout", 20))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
         return
 
     if name == "write_file":
+        # path 不能是已存在的目录（不能把目录当文件覆盖）
         path = context.path(args["path"])
         if path.exists() and path.is_dir():
             raise ValueError("path is a directory")
+        # content 是必填参数
         if "content" not in args:
             raise ValueError("missing content")
         return
@@ -137,16 +149,21 @@ def validate_tool(context, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
+        # 读取文件全文，统计 old_text 出现次数
         text = path.read_text(encoding="utf-8")
         count = text.count(old_text)
+        # 必须正好出现一次：0 次说明文件里没这段（模型记错了），
+        # 2+ 次说明 old_text 太短/太泛，可能改错位置
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
         return
 
     if name == "delegate":
+        # task 是委派给子 agent 的任务描述，不能为空
         task = str(args.get("task", "")).strip()
         if not task:
             raise ValueError("task must not be empty")
+        # 深度限制：当前深度已到上限，不能再 delegate
         if context.depth >= context.max_depth:
             raise ValueError("delegate depth exceeded")
         return

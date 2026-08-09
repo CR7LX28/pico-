@@ -309,7 +309,7 @@ class Pico:
         refresh = self.refresh_prefix()
         self.resume_state = self.evaluate_resume_state()
         prompt, metadata = self.context_manager.build(user_message)
-        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
+        # 这里把"这轮 prompt 是怎么拼出来的"连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
             {
@@ -341,7 +341,7 @@ class Pico:
         payload = self.redact_artifact(payload or {})
         payload["event"] = event
         payload["created_at"] = now()
-        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
+        # trace 是运行中的逐事件时间线，适合回答"这一轮 agent 到底做了什么"。
         self.run_store.append_trace(task_state, payload)
         return payload
 
@@ -390,7 +390,7 @@ class Pico:
 
         为什么存在：
         并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
+        `history`，这里只挑少量"下一轮大概率还会用到"的事实做提纯，
         例如最近读写过哪些文件、某个文件读出来的短摘要。
 
         输入 / 输出：
@@ -513,8 +513,8 @@ class Pico:
         """执行一次工具调用，并在执行前后套上完整护栏。
 
         为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
+        在 agent 系统里，真正危险的不是"模型会不会想调用工具"，而是
+        "平台有没有在执行前把边界守住"。这个函数就是工具层的总闸口：
         所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
 
         输入 / 输出：
@@ -523,7 +523,7 @@ class Pico:
           这样模型下一轮都能继续消费这份反馈。
 
         在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
+        它位于 `ask()` 的"模型决定要调用工具"之后，是控制循环里真正把模型
         意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
         是否需要回写记忆。
@@ -586,25 +586,28 @@ class Pico:
         )
 
     def spawn_delegate(self, args):
+        # 取出子 agent 的任务描述
         task = str(args.get("task", "")).strip()
+        # 创建一个"缩水版" Pico 实例作为子 agent
         child = Pico(
-            model_client=self.model_client,
-            workspace=self.workspace,
-            session_store=self.session_store,
-            run_store=self.run_store,
-            approval_policy="never",
-            max_steps=int(args.get("max_steps", 3)),
-            max_new_tokens=self.max_new_tokens,
-            depth=self.depth + 1,
-            max_depth=self.max_depth,
-            read_only=True,
-            secret_env_names=self.secret_env_names,
-            shell_env_allowlist=self.shell_env_allowlist,
+            model_client=self.model_client,          # 复用同一个模型，不额外创建连接
+            workspace=self.workspace,                # 共享同一个仓库视图
+            session_store=self.session_store,        # 共享 session 存储
+            run_store=self.run_store,                # 共享 run 存储，工件统一管理
+            approval_policy="never",                 # 子 agent 不弹审批，直接放行
+            max_steps=int(args.get("max_steps", 3)), # 步数上限更小（默认 3），防止子任务失控
+            max_new_tokens=self.max_new_tokens,      # 复用父 agent 的 token 预算
+            depth=self.depth + 1,                    # 深度 +1，防止无限委派套娃
+            max_depth=self.max_depth,                # 继承父 agent 的深度上限
+            read_only=True,                          # 强制只读！子 agent 只能调查，不能改文件
+            secret_env_names=self.secret_env_names,  # 继承敏感环境变量的脱敏配置
+            shell_env_allowlist=self.shell_env_allowlist,  # 继承 shell 环境变量白名单
         )
-        # 委派的目标是“调查”，不是“放权执行”。
-        # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
+        # 给子 agent 的 memory 里注入任务描述
         child.session["memory"]["task"] = task
+        # 给子 agent 带一点父 agent 的对话历史（裁剪到 300 字符），让它有上下文
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
+        # 跑子 agent 的完整主循环，返回纯文本结论（前缀加 delegate_result: 标识来源）
         return "delegate_result:\n" + child.ask(task)
 
     def tool_list_files(self, args):
@@ -647,7 +650,7 @@ class Pico:
 
         为什么存在：
         模型输出首先是自然语言文本，而 runtime 需要的是结构化决策：
-        “这是工具调用”还是“这是最终答案”。如果没有这层解析，后面的工具校验、
+        "这是工具调用"还是"这是最终答案"。如果没有这层解析，后面的工具校验、
         审批和执行链路就没法可靠工作。
 
         输入 / 输出：
