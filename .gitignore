@@ -7,7 +7,8 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-uv.lock
+
+# Lock files are intentionally tracked (uv.lock) for reproducible envs
 
 # Packaging
 *.egg-info/
@@ -25,19 +26,26 @@ htmlcov/
 *.temp
 *.swp
 *.swo
+*.log
 *~
+
+# Local scratch files
+.codex-login-launch.ps1
+.tmp_logquery.py
 
 # Local scratch space
 tmp/
 .worktrees/
 .pico/
 .mini-pico/
+.workbuddy/
 artifacts/
 release/
 readme_intro_locked/
 
 # IDE
 .idea/
+.vscode/
 
 # Local secrets and provider configuration
 .env
