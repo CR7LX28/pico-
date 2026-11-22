@@ -523,6 +523,16 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
     for note in state["episodic_notes"]:
         # 召回逻辑故意保持简单透明：先看 tag 精确命中，
         # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
+        source = note["source"]
+        if note["kind"] == "episodic" and source and note["tags"] == [source]:
+            # read_file also saves a file summary. Recall only the matching,
+            # current copy of the file observation.
+            summary = state["file_summaries"].get(source, {})
+            if (
+                note["text"] != summary.get("summary")
+                or summary.get("freshness") != file_freshness(source, workspace_root)
+            ):
+                continue
         note_tags = {tag.lower() for tag in note.get("tags", [])}
         note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
         exact_tag_match = int(bool(query_tokens & note_tags))

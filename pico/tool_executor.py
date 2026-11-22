@@ -3,7 +3,13 @@
 from dataclasses import dataclass
 import re
 
-from .workspace import clip
+from .features.memory import file_freshness
+from .run_store import tool_output_reference
+from .task_state import snapshot_fingerprint
+from .workspace import MAX_TOOL_OUTPUT, clip
+
+
+SHELL_PREVIEW_CHARS = 480
 
 
 @dataclass(frozen=True)
@@ -42,7 +48,7 @@ class ToolExecutor:
     def __init__(self, agent):
         self.agent = agent
 
-    def execute(self, name, args):
+    def execute(self, name, args, *, run_id=None):
         agent = self.agent
         if agent.allowed_tools is not None and name not in agent.allowed_tools:
             return ToolExecutionResult(
@@ -112,21 +118,42 @@ class ToolExecutor:
         before_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            content = clip(tool["run"](args))
+            output = tool["run"](args)
             after_snapshot = agent.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = agent.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             tool_status = "ok"
             tool_error_code = ""
+            evidence = {}
             if name == "run_shell":
-                match = re.search(r"exit_code:\s*(-?\d+)", content)
+                match = re.match(r"exit_code:\s*(-?\d+)", output)
                 exit_code = int(match.group(1)) if match else 0
+                if match:
+                    evidence["exit_code"] = exit_code
+                    evidence["verification_snapshot"] = snapshot_fingerprint(after_snapshot)
                 if exit_code != 0 and workspace_changed:
                     tool_status = "partial_success"
                     tool_error_code = "tool_partial_success"
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+                redacted_output = agent.redact_artifact(output)
+                if run_id and max(len(output), len(redacted_output)) > MAX_TOOL_OUTPUT:
+                    try:
+                        artifact = agent.run_store.write_shell_output(run_id, redacted_output, agent.root)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        evidence["artifact_error"] = agent.redact_text(str(exc))
+                        reference = "artifact unavailable (save failed)"
+                    else:
+                        evidence["artifact"] = artifact
+                        reference = f"read_file: {tool_output_reference(artifact)}"
+                    output = f"status: {tool_status}\n{reference}\n{clip(redacted_output, SHELL_PREVIEW_CHARS)}"
+                else:
+                    output = redacted_output
+            elif name == "read_file":
+                path = agent.memory.canonical_path(args["path"])
+                evidence["read_file_version"] = {"path": path, "freshness": file_freshness(path, agent.root)}
+            content = clip(output)
             agent.update_memory_after_tool(name, args, content)
             metadata = _metadata(
                 tool_status,
@@ -138,6 +165,8 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
             )
+            metadata.update(evidence)
+            metadata["changed_file_freshness"] = {path: after_snapshot.get(path) for path in affected_paths}
             agent.record_process_note_for_tool(name, metadata)
             return ToolExecutionResult(content=content, metadata=metadata)
         except Exception as exc:
@@ -156,5 +185,6 @@ class ToolExecutor:
                 workspace_fingerprint=agent.workspace.fingerprint(),
                 diff_summary=diff_summary,
             )
+            metadata["changed_file_freshness"] = {path: after_snapshot.get(path) for path in affected_paths}
             agent.record_process_note_for_tool(name, metadata)
             return ToolExecutionResult(content=f"error: tool {name} failed: {exc}", metadata=metadata)

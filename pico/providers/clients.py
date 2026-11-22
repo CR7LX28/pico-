@@ -78,6 +78,11 @@ class OllamaModelClient:
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
+        self.last_completion_metadata = {
+            key: data[field]
+            for key, field in (("input_tokens", "prompt_eval_count"), ("output_tokens", "eval_count"))
+            if field in data
+        }
         return data.get("response", "")
 
 

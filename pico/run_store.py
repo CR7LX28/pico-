@@ -7,6 +7,16 @@ session.json 负责保存“可恢复的会话状态”；RunStore 负责保存�
 import json
 import tempfile
 from pathlib import Path
+from uuid import uuid4
+
+
+MAX_SHELL_ARTIFACT_BYTES = 256 * 1024
+SHELL_ARTIFACT_TRUNCATION = b"\n...[artifact truncated at byte limit; middle omitted]...\n"
+
+
+def tool_output_reference(artifact):
+    truncation = ", truncated" if artifact["truncated"] else ""
+    return f'{artifact["path"]} ({artifact["lines"]} lines{truncation})'
 
 
 def _run_id(value):
@@ -61,6 +71,37 @@ class RunStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(path, report)
         return path
+
+    def write_shell_output(self, run_id, redacted_output, workspace_root):
+        path = (self.run_dir(run_id) / "tool_outputs" / f"{uuid4().hex}.log").resolve()
+        workspace_root = Path(workspace_root).resolve()
+        if not path.is_relative_to(workspace_root):
+            raise ValueError("artifact path escapes workspace")
+
+        data = redacted_output.encode("utf-8")
+        truncated = len(data) > MAX_SHELL_ARTIFACT_BYTES
+        if truncated:
+            available = MAX_SHELL_ARTIFACT_BYTES - len(SHELL_ARTIFACT_TRUNCATION)
+            head_size = available // 2
+            tail_size = available - head_size
+            head = data[:head_size].decode("utf-8", errors="ignore")
+            tail = data[-tail_size:].decode("utf-8", errors="ignore")
+            data = head.encode("utf-8") + SHELL_ARTIFACT_TRUNCATION + tail.encode("utf-8")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent)
+        temp_path = Path(handle.name)
+        try:
+            with handle:
+                handle.write(data)
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return {
+            "path": path.relative_to(workspace_root).as_posix(),
+            "lines": len(data.decode("utf-8").splitlines()),
+            "truncated": truncated,
+        }
 
     def load_task_state(self, task_id):
         return json.loads(self.task_state_path(task_id).read_text(encoding="utf-8"))

@@ -1752,6 +1752,7 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
 
 def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
     agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    agent.context_manager.section_budgets["history"] = 2200
     old_text = "OLD-" + ("A" * 320)
     recent_text = "RECENT-" + ("B" * 320)
 
@@ -1769,6 +1770,7 @@ def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
     prompt = agent.model_client.prompts[-1]
 
     assert recent_text in prompt
+    assert "OLD-" in prompt
     assert old_text not in prompt
 
 

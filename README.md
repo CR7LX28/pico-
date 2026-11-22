@@ -231,6 +231,18 @@ ollama pull qwen3.5:4b
 uv run pico --provider ollama --model qwen3.5:4b
 ```
 
+## 上下文预算和任务摘要
+
+Pico 先按规则裁剪上下文。默认使用 12000 字符作为组装目标，并记录发送前的 token 估算。已知后端的实际模型窗口时，可以用 `--context-window-tokens` 指定。Pico 从窗口扣除 `--max-new-tokens`（默认 512），把剩余量作为输入上限。规则裁剪后仍超过这个上限时，Pico 会保留当前请求原文并报告超限。后端返回的实测 token 单独记录。
+
+默认将最近 6 条历史记录排除在摘要范围外。规则裁剪后仍超预算，或更早的未摘要记录达到 12 条时，Pico 会尝试生成一份任务摘要。摘要与原始历史一起保存，恢复会话时继续使用。摘要失败时沿用原有摘要和规则裁剪。`--context-summary-threshold` 可调整条数，设为 `0` 可关闭新的摘要调用。
+
+例如，后端窗口配置为 32768 token 时，可以这样恢复最近的会话。
+
+```bash
+uv run pico --resume latest --context-window-tokens 32768 --context-summary-threshold 12
+```
+
 ## 常用交互命令
 
 - `/help`：查看内置命令

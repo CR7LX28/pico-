@@ -1,8 +1,10 @@
 """Checkpoint and resume-state helpers."""
 
 import uuid
+from copy import deepcopy
 
 from .features import memory as memorylib
+from .task_state import TaskContext
 from .workspace import clip, now
 
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
@@ -55,6 +57,22 @@ def current_checkpoint(agent):
     if not checkpoint_id:
         return None
     return state.get("items", {}).get(checkpoint_id)
+
+
+def load_task_context(agent):
+    if isinstance(saved := agent.session.get("task_context"), dict):
+        return TaskContext.from_dict(saved)
+    checkpoint = current_checkpoint(agent) or {}
+    compatible = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_VERSION
+    if compatible and isinstance(saved := checkpoint.get("task_context"), dict):
+        return TaskContext.from_dict(saved)
+    context = TaskContext()
+    for index, item in enumerate(agent.session["history"]):
+        if item["role"] == "user":
+            context.record_request(item["content"], {"history_index": index})
+    if compatible and not context.goal and checkpoint.get("current_goal"):
+        context.record_request(checkpoint["current_goal"], {"checkpoint_id": checkpoint.get("checkpoint_id", "")})
+    return context
 
 
 def evaluate_resume_state(agent):
@@ -114,18 +132,27 @@ def render_checkpoint_text(agent):
     lines = [
         "Task checkpoint:",
         f"- Resume status: {agent.resume_state.get('status', CHECKPOINT_NONE_STATUS)}",
+    ]
+    if agent.resume_state.get("stale_paths"):
+        lines.append("- Stale paths (re-read before use): " + ", ".join(agent.resume_state["stale_paths"]))
+    # Structured evidence is projected once, in memory. Old checkpoint
+    # guidance can still help orient a resumed legacy session.
+    if "task_context" in checkpoint or checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        return "\n".join(lines)
+    lines.append("Legacy checkpoint guidance (historical):")
+    lines.extend([
         f"- Current goal: {checkpoint.get('current_goal', '-') or '-'}",
         f"- Current blocker: {checkpoint.get('current_blocker', '-') or '-'}",
         f"- Next step: {checkpoint.get('next_step', '-') or '-'}",
-    ]
+    ])
     key_files = [str(item.get("path", "")).strip() for item in checkpoint.get("key_files", []) if str(item.get("path", "")).strip()]
     lines.append(f"- Key files: {', '.join(key_files) or '-'}")
+    if agent.resume_state.get("status") != CHECKPOINT_FULL_VALID_STATUS:
+        return "\n".join(lines)
     if checkpoint.get("completed"):
         lines.append("- Completed: " + " | ".join(str(item) for item in checkpoint.get("completed", [])))
     if checkpoint.get("excluded"):
         lines.append("- Excluded: " + " | ".join(str(item) for item in checkpoint.get("excluded", [])))
-    if agent.resume_state.get("stale_paths"):
-        lines.append("- Stale paths: " + ", ".join(agent.resume_state["stale_paths"]))
     summary = str(checkpoint.get("summary", "")).strip()
     if summary:
         lines.append(f"- Summary: {summary}")
@@ -152,12 +179,14 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         file_freshness = memorylib.file_freshness(path, agent.root)
         freshness[path] = file_freshness
         key_files.append({"path": path, "freshness": file_freshness})
+    task_context = deepcopy(agent.session.get("task_context", {}))
     checkpoint = {
         "checkpoint_id": checkpoint_id,
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "created_at": now(),
-        "current_goal": str(user_message),
+        "current_goal": task_context.get("goal", {}).get("text", str(user_message)),
+        "task_context": task_context,
         "completed": [task_state.final_answer] if task_state.final_answer else [],
         "excluded": [],
         "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),

@@ -16,6 +16,7 @@ from . import checkpoint as checkpointlib
 from .features import memory as memorylib
 from . import security as securitylib
 from .context_manager import ContextManager
+from .context_summary import DEFAULT_SUMMARY_THRESHOLD
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
@@ -68,6 +69,8 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        context_window_tokens=None,
+        context_summary_threshold=DEFAULT_SUMMARY_THRESHOLD,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -76,6 +79,12 @@ class Pico:
         self.approval_policy = approval_policy
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
+        if context_window_tokens is not None and context_window_tokens <= 0:
+            raise ValueError("context_window_tokens must be positive")
+        if context_summary_threshold < 0:
+            raise ValueError("context_summary_threshold must be non-negative")
+        self.context_window_tokens = context_window_tokens
+        self.context_summary_threshold = context_summary_threshold
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -305,10 +314,10 @@ class Pico:
         _, metadata = self._build_prompt_and_metadata(user_message)
         return metadata
 
-    def _build_prompt_and_metadata(self, user_message):
+    def _build_prompt_and_metadata(self, user_message, *, notice="", context_summary=None):
         refresh = self.refresh_prefix()
         self.resume_state = self.evaluate_resume_state()
-        prompt, metadata = self.context_manager.build(user_message)
+        prompt, metadata = self.context_manager.build(user_message, notice=notice, context_summary=context_summary)
         # 这里把"这轮 prompt 是怎么拼出来的"连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
@@ -504,8 +513,8 @@ class Pico:
 
         return AgentLoop(self).run(user_message)
 
-    def execute_tool(self, name, args):
-        result = self.tool_executor.execute(name, args)
+    def execute_tool(self, name, args, *, run_id=None):
+        result = self.tool_executor.execute(name, args, run_id=run_id)
         self._last_tool_result_metadata = dict(result.metadata)
         return result
 
@@ -597,6 +606,8 @@ class Pico:
             approval_policy="never",                 # 子 agent 不弹审批，直接放行
             max_steps=int(args.get("max_steps", 3)), # 步数上限更小（默认 3），防止子任务失控
             max_new_tokens=self.max_new_tokens,      # 复用父 agent 的 token 预算
+            context_window_tokens=self.context_window_tokens,
+            context_summary_threshold=self.context_summary_threshold,
             depth=self.depth + 1,                    # 深度 +1，防止无限委派套娃
             max_depth=self.max_depth,                # 继承父 agent 的深度上限
             read_only=True,                          # 强制只读！子 agent 只能调查，不能改文件
@@ -766,6 +777,10 @@ class Pico:
 
     def reset(self):
         self.session["history"] = []
+        self.session.pop("context_summary", None)
+        self.session.pop("context_summary_failed_range", None)
+        self.session["task_context"] = {}
+        self.session["checkpoints"] = {"current_id": "", "items": {}}
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)

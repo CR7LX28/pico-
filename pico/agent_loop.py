@@ -2,7 +2,14 @@
 
 import time
 
-from .checkpoint import CHECKPOINT_NONE_STATUS, CHECKPOINT_PARTIAL_STALE_STATUS, CHECKPOINT_WORKSPACE_MISMATCH_STATUS
+from .checkpoint import (
+    CHECKPOINT_NONE_STATUS,
+    CHECKPOINT_PARTIAL_STALE_STATUS,
+    CHECKPOINT_WORKSPACE_MISMATCH_STATUS,
+    load_task_context,
+)
+from .context_budget import completion_usage, estimate_input_tokens
+from .context_summary import RECENT_HISTORY_ENTRIES, parse_summary, plan_summary
 from .task_state import TaskState
 from .workspace import clip, now
 
@@ -10,6 +17,67 @@ from .workspace import clip, now
 class AgentLoop:
     def __init__(self, agent):
         self.agent = agent
+
+    def _prepare_prompt(self, task_state, user_message, *, notice=""):
+        agent = self.agent
+        prompt, metadata = agent._build_prompt_and_metadata(user_message, notice=notice)
+        plan = plan_summary(agent, metadata)
+        if plan is None:
+            return prompt, metadata
+
+        started_at = time.monotonic()
+        failure_reason = None
+        error = ""
+        try:
+            raw = agent.model_client.complete(plan.prompt, agent.max_new_tokens)
+        except Exception as exc:
+            failure_reason = "model_error"
+            error = clip(agent.redact_text(str(exc)), 300)
+        else:
+            summary = parse_summary(raw, plan.end, agent.redact_text)
+            if summary is None:
+                failure_reason = "empty_summary" if isinstance(raw, str) and not raw.strip() else "invalid_summary"
+        finally:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            usage = completion_usage(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+
+        if failure_reason is None:
+            candidate_prompt, candidate = agent._build_prompt_and_metadata(
+                user_message, notice=notice, context_summary=summary,
+            )
+            recent_to_keep = min(RECENT_HISTORY_ENTRIES, metadata["history"]["recent_count"])
+            if (candidate["history"]["summary_covered_history_count"] != plan.end
+                or candidate["history"]["recent_count"] < recent_to_keep
+                or candidate["context_window_exceeded"]
+                or candidate["prompt_over_budget"]):
+                failure_reason = "summary_does_not_fit"
+            else:
+                session = {**agent.session, "context_summary": summary}
+                session.pop("context_summary_failed_range", None)
+                try:
+                    agent.session_path = agent.session_store.save(session)
+                except OSError as exc:
+                    failure_reason = "persistence_error"
+                    error = clip(agent.redact_text(str(exc)), 300)
+                else:
+                    agent.session["context_summary"] = summary
+                    agent.session.pop("context_summary_failed_range", None)
+                    prompt, metadata = candidate_prompt, candidate
+
+        trace = {
+            "trigger_reason": plan.reason,
+            "history_start_index": plan.start,
+            "covered_history_count": plan.end,
+            "duration_ms": duration_ms,
+            "input_tokens_estimated": estimate_input_tokens(plan.prompt),
+            "input_tokens_estimate_source": "heuristic",
+            **usage,
+        }
+        if failure_reason:
+            agent.session["context_summary_failed_range"] = [plan.start, plan.end, plan.eligible_end]
+            trace.update(failure_reason=failure_reason, error=error)
+        agent.emit_trace(task_state, "context_summary_failed" if failure_reason else "context_summary_saved", trace)
+        return prompt, metadata
 
     def _persist_model_failure(self, task_state, user_message, exc, run_started_at, prompt_metadata):
         agent = self.agent
@@ -43,6 +111,14 @@ class AgentLoop:
 
     def _request_model(self, task_state, user_message, prompt, prompt_metadata, run_started_at, purpose):
         agent = self.agent
+        if prompt_metadata.get("context_window_exceeded"):
+            estimated = prompt_metadata["input_tokens_estimated"]
+            budget = prompt_metadata["input_budget_tokens"]
+            exc = RuntimeError(f"Context window exceeded: estimated input {estimated} tokens, available {budget}.")
+            agent.last_completion_metadata = {}
+            agent.emit_trace(task_state, "context_window_exceeded", {"purpose": purpose, "input_budget_tokens": budget})
+            self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
+            raise exc
         agent.emit_trace(
             task_state,
             "model_requested",
@@ -68,6 +144,7 @@ class AgentLoop:
             )
         except Exception as exc:
             completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+            completion_metadata.update(completion_usage(completion_metadata))
             if completion_metadata:
                 prompt_metadata.update(completion_metadata)
             agent.last_completion_metadata = completion_metadata
@@ -75,6 +152,7 @@ class AgentLoop:
             self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
             raise
         completion_metadata = dict(getattr(agent.model_client, "last_completion_metadata", {}) or {})
+        completion_metadata.update(completion_usage(completion_metadata))
         if completion_metadata:
             prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
@@ -124,13 +202,16 @@ class AgentLoop:
         agent = self.agent
         # 记录本轮 run 的起始时间，用于最后统计总耗时
         run_started_at = time.monotonic()
-        # [1] 把当前请求写入 memory 的任务摘要，供后续 prompt 组装时引用
+        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
+        task_context = load_task_context(agent)
+        source = {"run_id": task_state.run_id, "history_index": len(agent.session["history"])}
+        task_context.record_request(user_message, source)
+        agent.session["task_context"] = task_context.to_dict()
+        # 最新请求短文本与跨轮任务状态各自更新。
         agent.memory.set_task_summary(user_message)
-        # [2] 把用户消息写进 session history（role: user），每轮 prompt 都会带上
+        agent.session["memory"] = agent.memory.to_dict()
         agent.record({"role": "user", "content": user_message, "created_at": now()})
 
-        # [3] 创建 TaskState，一个 run_id 绑定一个 task_id，一次请求 = 一条独立 run
-        task_state = TaskState.create(run_id=agent.new_run_id(), task_id=agent.new_task_id(), user_request=user_message)
         # [4] 标记恢复状态（新 run 为 no-checkpoint，恢复时为 full-valid / partial-stale）
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         # [5] 挂到 agent 上，后续主循环每轮都读写它
@@ -169,7 +250,7 @@ class AgentLoop:
 
             prompt_started_at = time.monotonic()
             # 重建 prompt：history + memory + workspace 每轮都可能变，所以必须重新投影
-            prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
+            prompt, prompt_metadata = self._prepare_prompt(task_state, user_message)
             agent.emit_trace(
                 task_state,
                 "prompt_built",
@@ -244,19 +325,33 @@ class AgentLoop:
                 task_state.record_tool(name)      # 更新 last_tool 并累加 tool_steps
 
                 tool_started_at = time.monotonic()
-                tool_result = agent.execute_tool(name, args)  # 闸口：校验 → 审批 → 执行
+                tool_result = agent.execute_tool(name, args, run_id=task_state.run_id)
                 result = tool_result.content
                 # 三处落盘，同一份结果三种视角：
-                # ① record → session history：完整结果，给模型下轮看
-                agent.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
+                # ① session history 保存模型可见的结果，长命令日志带运行工件引用。
+                item = {"role": "tool", "name": name, "args": args, "content": result, "created_at": now()}
+                if "artifact" in tool_result.metadata:
+                    item["artifact"] = tool_result.metadata["artifact"]
+                    item["tool_status"] = tool_result.metadata["tool_status"]
+                if "read_file_version" in tool_result.metadata:
+                    item["read_file_version"] = tool_result.metadata["read_file_version"]
+                source = {
+                    "run_id": task_state.run_id,
+                    "tool_step": task_state.tool_steps,
+                    "history_index": len(agent.session["history"]),
+                }
+                task_context.record_tool(name, args, tool_result, source, agent.redact_text)
+                agent.session["task_context"] = task_context.to_dict()
+                agent.session["memory"] = agent.memory.to_dict()
+                agent.record(item)
                 # ② write_task_state → task_state.json：只更新计数（tool_steps / last_tool），给监控看
                 agent.run_store.write_task_state(task_state)
                 # ③ emit_trace → trace.jsonl：裁剪后摘要 + 耗时 + 工具元数据，给人排错看
                 agent.emit_trace(
                     task_state, "tool_executed",
                     {
-                        "name": name, "args": args,
-                        "result": clip(result, 500),  # trace 里裁剪到 500 字符，完整结果在 history 里
+                        "name": name, "args": args, "tool_step": task_state.tool_steps,
+                        "result": clip(result, 500),
                         "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
                         **dict(tool_result.metadata or {}),  # 工具返回的安全级别、错误码等
                     },
@@ -290,12 +385,12 @@ class AgentLoop:
             task_state.record_attempt()
             agent.run_store.write_task_state(task_state)
             prompt_started_at = time.monotonic()
-            prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
-            prompt += (
+            notice = (
                 "\n\nRuntime notice: the tool budget is exhausted. Do not call another tool. "
                 "Use the evidence already present in the tool history and return exactly one "
                 "non-empty <final>...</final> answer."
             )
+            prompt, prompt_metadata = self._prepare_prompt(task_state, user_message, notice=notice)
             prompt_metadata["finalization"] = True
             agent.emit_trace(
                 task_state,

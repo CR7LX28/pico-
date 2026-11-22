@@ -12,6 +12,7 @@ import sys
 import textwrap
 
 from .config import load_project_env, provider_env
+from .context_summary import DEFAULT_SUMMARY_THRESHOLD
 from .providers.clients import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import Pico, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -248,6 +249,10 @@ def build_agent(args):
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
+    context_options = {
+        "context_window_tokens": getattr(args, "context_window_tokens", None),
+        "context_summary_threshold": getattr(args, "context_summary_threshold", DEFAULT_SUMMARY_THRESHOLD),
+    }
     if session_id:
         return Pico.from_session(
             model_client=model,
@@ -258,6 +263,7 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            **context_options,
         )
     return Pico(
         model_client=model,
@@ -267,6 +273,7 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        **context_options,
     )
 
 
@@ -303,6 +310,11 @@ def build_arg_parser():
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--context-window-tokens", type=int, help="Known context window of the selected model.")
+    parser.add_argument(
+        "--context-summary-threshold", type=int, default=DEFAULT_SUMMARY_THRESHOLD,
+        help="Number of new older history entries that triggers a summary. Set 0 to disable summary calls.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser

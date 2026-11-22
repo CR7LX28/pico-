@@ -18,9 +18,9 @@ BASE_TOOL_SPECS = {
         "description": "List files in the workspace.",
     },
     "read_file": {
-        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "schema": {"path": "str", "start": "int=1", "end": "int=200", "start_column": "int=1"},
         "risky": False,
-        "description": "Read a UTF-8 file by line range.",
+        "description": "Read a UTF-8 file or shell log by line range. Use start_column to resume a long first line.",
     },
     "search": {
         "schema": {"pattern": "str", "path": "str='.'"},
@@ -97,15 +97,7 @@ def validate_tool(context, name, args):
         return
 
     if name == "read_file":
-        # path 必须是真实文件（不能是目录）
-        path = context.path(args["path"])
-        if not path.is_file():
-            raise ValueError("path is not a file")
-        # 行号范围：start 必须 >=1，end 必须 >= start（默认 1~200 行）
-        start = int(args.get("start", 1))
-        end = int(args.get("end", 200))
-        if start < 1 or end < start:
-            raise ValueError("invalid line range")
+        _read_file_range(context, args)
         return
 
     if name == "search":
@@ -184,16 +176,29 @@ def tool_list_files(context, args):
     return "\n".join(lines) or "(empty)"
 
 
-def tool_read_file(context, args):
+def _read_file_range(context, args):
     path = context.path(args["path"])
+    if not path.exists():
+        raise ValueError("file not found")
     if not path.is_file():
         raise ValueError("path is not a file")
     start = int(args.get("start", 1))
     end = int(args.get("end", 200))
+    start_column = int(args.get("start_column", 1))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
+    if start_column < 1:
+        raise ValueError("start_column must be >= 1")
+    return path, start, end, start_column
+
+
+def tool_read_file(context, args):
+    path, start, end, start_column = _read_file_range(context, args)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
+    selected = lines[start - 1:end]
+    if selected:
+        selected[0] = selected[0][start_column - 1:]
+    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(selected, start=start))
     return f"# {path.relative_to(context.root)}\n{body}"
 
 

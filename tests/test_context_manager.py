@@ -1,3 +1,8 @@
+import json
+from copy import deepcopy
+
+import pytest
+
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico.context_manager import ContextManager
 
@@ -119,7 +124,7 @@ def test_context_manager_preserves_current_request_when_over_budget(tmp_path):
     agent.memory.retrieval_view = lambda query, limit=3: "Relevant memory:\n" + "\n".join(f"- {i} " + ("C" * 220) for i in range(5))
     agent.history_text = lambda: "Transcript:\n" + "\n".join(f"[user] {i} " + ("D" * 220) for i in range(5))
 
-    request = "please preserve this request exactly"
+    request = "  please preserve this request exactly\n\n  "
     prompt, metadata = ContextManager(
         agent,
         total_budget=250,
@@ -136,7 +141,8 @@ def test_context_manager_preserves_current_request_when_over_budget(tmp_path):
     assert metadata["current_request"]["rendered_chars"] == len(request)
 
 
-def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(tmp_path):
+@pytest.mark.parametrize("strategy", ["dynamic", "fixed"])
+def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(tmp_path, strategy):
     file_path = tmp_path / "sample.txt"
     file_path.write_text("alpha\nbeta\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
@@ -149,7 +155,7 @@ def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(t
                 "role": "tool",
                 "name": "read_file",
                 "args": {"path": "sample.txt", "start": 1, "end": 2},
-                "content": "# sample.txt\nalpha\nbeta\n",
+                "content": "# sample.txt\nalpha\nbeta\n" + ("x" * 200),
                 "created_at": created_at,
             }
         )
@@ -164,14 +170,18 @@ def test_context_manager_collapses_older_duplicate_reads_into_one_summary_line(t
             }
         )
 
-    prompt, metadata = ContextManager(agent).build("check the file")
+    prompt, metadata = ContextManager(
+        agent, history_strategy=strategy, section_budgets={"history": 210},
+    ).build("check the file")
     transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
-    assert transcript.count("[tool:read_file]") == 0
-    assert "sample.txt -> alpha | beta" in transcript
+    assert transcript.count("[tool:read_file]") == 1
+    assert '[tool:read_file] {"end": 2, "path": "sample.txt", "start": 1} -> alpha | beta' in transcript
     assert metadata["history"]["older_entries_count"] == 1
     assert metadata["history"]["collapsed_duplicate_reads"] == 1
     assert metadata["history"]["reused_file_summary_count"] == 1
+    assert metadata["history"]["shortened_entries"] == [{"index": 1, "reason": "file_summary"}]
+    assert metadata["history"]["omitted_entries"] == [{"index": 0, "reason": "duplicate_read"}]
 
 
 def test_context_manager_summarizes_older_tool_output_into_one_line(tmp_path):
@@ -196,13 +206,118 @@ def test_context_manager_summarizes_older_tool_output_into_one_line(tmp_path):
             }
         )
 
-    prompt, metadata = ContextManager(agent).build("check failures")
+    prompt, metadata = ContextManager(agent, history_strategy="fixed").build("check failures")
     transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
-    assert 'pytest -q -> FAIL test_one | FAIL test_two | FAIL test_three' in transcript
+    assert '[tool:run_shell] {"command": "pytest -q"} -> FAIL test_one | FAIL test_two | FAIL test_three ...' in transcript
     assert "FAIL test_four" not in transcript
     assert metadata["history"]["summarized_tool_count"] == 1
     assert metadata["history"]["reused_file_summary_count"] == 0
+
+
+def test_dynamic_history_can_keep_more_than_six_recent_entries(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for index in range(9):
+        agent.record({"role": "user", "content": f"history-{index}: " + ("x" * 75)})
+
+    dynamic, dynamic_meta = ContextManager(agent).build("continue")
+    fixed, fixed_meta = ContextManager(agent, history_strategy="fixed").build("continue")
+
+    assert dynamic_meta["history"]["recent_count"] == 9
+    assert dynamic_meta["history"]["retained_count"] == 9
+    assert dynamic_meta["history"]["shortened_entries"] == []
+    assert dynamic_meta["history"]["omitted_entries"] == []
+    assert fixed_meta["history"]["recent_count"] == 6
+    assert fixed_meta["history"]["retained_count"] == 9
+    assert [entry["index"] for entry in fixed_meta["history"]["shortened_entries"]] == [0, 1, 2]
+    assert "history-0: " + ("x" * 75) in dynamic
+    assert "history-0: " + ("x" * 75) not in fixed
+    offsets = [dynamic.index(f"history-{index}:") for index in range(9)]
+    assert offsets == sorted(offsets)
+
+
+@pytest.mark.parametrize("strategy", ["dynamic", "fixed"])
+def test_history_treats_oversized_tool_call_and_result_as_one_entry(tmp_path, strategy):
+    agent = build_agent(tmp_path, [])
+    agent.record({
+        "role": "tool",
+        "name": "run_shell",
+        "args": {"command": "phase1-smoke --run " + ("a" * 1000)},
+        "content": "FAIL smoke test " + ("b" * 2000),
+    })
+    original_history = deepcopy(agent.session["history"])
+    original_session = agent.session_path.read_bytes()
+
+    for budget, kept in [(4000, True), (180, True), (40, False), (0, False)]:
+        prompt, metadata = ContextManager(
+            agent, section_budgets={"history": budget}, history_strategy=strategy,
+        ).build("continue")
+        history = metadata["history"]
+        assert history["strategy"] == strategy
+        assert history["budget_chars"] == budget
+        assert history["rendered_chars"] <= budget
+        assert history["retained_count"] == int(kept)
+        assert ("[tool:run_shell]" in prompt) == kept
+        assert ("phase1-smoke --run" in prompt) == kept
+        assert ("FAIL smoke test" in prompt) == kept
+        assert ("a" * 1000 in prompt) == (budget == 4000)
+        if budget == 4000:
+            assert history["shortened_entries"] == []
+            assert history["omitted_entries"] == []
+        elif kept:
+            assert [entry["index"] for entry in history["shortened_entries"]] == [0]
+            assert history["omitted_entries"] == []
+        else:
+            assert history["shortened_entries"] == []
+            assert history["omitted_entries"] == [{"index": 0, "reason": "budget"}]
+
+    assert agent.session["history"] == original_history
+    assert agent.session_path.read_bytes() == original_session
+
+
+def test_total_budget_shrink_reselects_dynamic_history(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for index in range(10):
+        agent.record({"role": "assistant", "content": f"entry-{index}: " + ("x" * 30)})
+    manager = ContextManager(
+        agent,
+        section_budgets={"prefix": 40, "memory": 40, "relevant_memory": 25, "history": 600},
+    )
+    request = "continue with this request\n  "
+    _, before = manager.build(request)
+
+    manager.total_budget = 340
+    prompt, after = manager.build(request)
+
+    assert before["history"]["recent_count"] == 10
+    assert any(step["section"] == "history" for step in after["budget_reductions"])
+    assert after["history"]["budget_chars"] < before["history"]["budget_chars"]
+    assert after["history"]["rendered_chars"] <= after["history"]["budget_chars"]
+    assert after["history"]["retained_count"] < before["history"]["retained_count"]
+    assert "entry-9:" in prompt
+    assert "entry-0:" not in prompt
+    assert len(prompt) <= manager.total_budget
+    assert prompt.split("Current user request:\n", 1)[1] == request
+
+
+def test_prompt_built_trace_records_history_decisions(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    agent.record({"role": "user", "content": "older " * 100})
+    agent.record({"role": "user", "content": "newer " * 100})
+    agent.context_manager.section_budgets["history"] = 100
+
+    assert agent.ask("continue") == "Done."
+
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    history = next(event["prompt_metadata"]["history"] for event in events if event["event"] == "prompt_built")
+    assert history == agent.last_prompt_metadata["history"]
+    assert history["strategy"] == "dynamic"
+    assert history["budget_chars"] == 100
+    assert history["rendered_chars"] < history["budget_chars"]
+    assert history["retained_count"] == 2
+    assert history["shortened_entries"] == [{"index": 1, "reason": "older_history"}]
+    assert history["omitted_entries"] == [{"index": 0, "reason": "budget"}]
 
 
 def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
