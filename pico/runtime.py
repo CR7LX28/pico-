@@ -388,8 +388,10 @@ class Pico:
                 summaries.append(f"modified:{path}")
         return changed_paths, summaries
 
-    def create_checkpoint(self, task_state, user_message, trigger):
-        return checkpointlib.create_checkpoint(self, task_state, user_message, trigger)
+    def create_checkpoint(self, task_state, user_message, trigger, *, event=None, task_context=None):
+        return checkpointlib.create_checkpoint(
+            self, task_state, user_message, trigger, event=event, task_context=task_context,
+        )
 
     def infer_next_step(self, task_state):
         return checkpointlib.infer_next_step(task_state)

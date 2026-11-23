@@ -8,7 +8,7 @@ import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico.context_manager import ContextManager
-from pico.run_store import MAX_SHELL_ARTIFACT_BYTES, SHELL_ARTIFACT_TRUNCATION, RunStore
+from pico.run_store import MAX_SHELL_ARTIFACT_BYTES, SHELL_ARTIFACT_TRUNCATION, SHELL_LOG_READ_CHARS, RunStore
 
 
 def tool_call(name, **args):
@@ -34,17 +34,19 @@ def test_long_shell_artifact_is_readable_from_compact_history_after_resume(tmp_p
     secret = "phase-two-test-secret-value"
     monkeypatch.setenv("PICO_TEST_TOKEN", secret)
     failure = "ERROR E482: migration checksum mismatch"
+    detail = "migration input: schema_20260408.sql"
     call = shell_call(
         tmp_path,
         f"import sys\nprint({secret!r})\n"
         "for index in range(1200):\n    print(f'progress item {index}')\n"
-        f"print('x' * 6000 + {failure!r}, file=sys.stderr)\n"
+        f"print('x' * 6000 + {detail!r} + ' ' + 'y' * 300 + ' ' + {failure!r}, file=sys.stderr)\n"
         "sys.exit(3)\n",
     )
     agent = build_agent(tmp_path, [call, "<final>Command failed. See the log.</final>"])
     assert agent.ask("Run the migration.") == "Command failed. See the log."
     first_run = agent.current_task_state.run_id
     shell_event = next(item for item in agent.session["history"] if item["role"] == "tool")
+    assert "artifact" in shell_event, agent._last_tool_result_metadata.get("artifact_error", shell_event["content"])
     artifact = shell_event["artifact"]
     assert artifact["path"].startswith(f".pico/runs/{first_run}/tool_outputs/")
     assert not artifact["truncated"]
@@ -52,10 +54,14 @@ def test_long_shell_artifact_is_readable_from_compact_history_after_resume(tmp_p
     assert "long_log.py" in shell_event["args"]["command"]
     assert "exit_code: 3" in shell_event["content"]
     assert "progress item 0" in shell_event["content"]
-    assert failure not in agent.model_client.prompts[-1]
+    assert failure in agent.model_client.prompts[-1]
+    assert detail not in agent.model_client.prompts[-1]
     assert "progress item 1000" not in agent.model_client.prompts[-1]
     assert artifact["path"] in agent.model_client.prompts[-1]
     assert secret not in agent.model_client.prompts[-1]
+    error = next(iter(agent.session["task_context"]["open_errors"].values()))
+    assert error["log_excerpt"]["line"] == artifact["lines"] == 1205
+    assert failure in error["log_excerpt"]["text"]
 
     persisted = (tmp_path / artifact["path"]).read_text(encoding="utf-8")
     assert failure in persisted
@@ -69,31 +75,34 @@ def test_long_shell_artifact_is_readable_from_compact_history_after_resume(tmp_p
         def complete(self, prompt, max_new_tokens, **kwargs):
             self.prompts.append(prompt)
             if len(self.prompts) == 1:
-                assert failure not in prompt
+                assert detail not in prompt
+                assert failure in prompt.split("Transcript:", 1)[0]
                 assert "progress item 1000" not in prompt
-                assert "error | read_file:" in prompt
                 match = re.search(r"read_file: (\S+\.log) \((\d+) lines\)", prompt)
                 assert match
                 path, last_line = match.groups()
                 return tool_call("read_file", path=path, start=int(last_line), end=int(last_line), start_column=6001)
-            match = re.search(r"ERROR E\d+: [^\n]+", prompt)
+            transcript = prompt.split("Transcript:", 1)[1]
+            assert transcript.count(detail) == 1
+            match = re.search(r"ERROR E\d+: [^\n]+", transcript)
             assert match
             return f"<final>{match.group()}</final>"
 
     resumed = Pico.from_session(
         model_client=LogRecoveryModel([]),
-        workspace=agent.workspace,
+        workspace=WorkspaceContext.build(tmp_path, repo_root_override=tmp_path),
         session_store=agent.session_store,
         session_id=agent.session["id"],
         read_only=True,
         allowed_tools=["read_file"],
     )
-    resumed.context_manager = ContextManager(resumed, section_budgets={"history": 390})
+    resumed.context_manager = ContextManager(resumed, section_budgets={"history": 120})
     assert resumed.ask("Recover the exact error from the previous run.") == failure
     assert resumed.current_task_state.run_id != first_run
     read = next(item for item in resumed.session["history"] if item.get("name") == "read_file")
     assert read["args"]["path"] == artifact["path"]
     assert failure in read["content"]
+    assert resumed.last_prompt_metadata["history"]["artifact_read_chars"] > 120
 
     (tmp_path / artifact["path"]).unlink()
     missing = resumed.execute_tool("read_file", read["args"])
@@ -106,6 +115,7 @@ def test_oversized_shell_artifact_retains_ends_and_marks_omission(tmp_path):
     agent = build_agent(tmp_path, [call, "<final>Done.</final>"])
     assert agent.ask("Run the command.") == "Done."
     event = next(item for item in agent.session["history"] if item["role"] == "tool")
+    assert "artifact" in event, agent._last_tool_result_metadata.get("artifact_error", event["content"])
     artifact = event["artifact"]
     path = tmp_path / artifact["path"]
     data = path.read_bytes()
@@ -114,8 +124,45 @@ def test_oversized_shell_artifact_retains_ends_and_marks_omission(tmp_path):
     assert b"first line" in data and b"last line" in data
     assert artifact["truncated"]
     assert "lines, truncated)" in event["content"]
-    result = agent.run_tool("read_file", {"path": artifact["path"], "start": artifact["lines"] - 2})
+    last_line = next(index for index, line in enumerate(data.splitlines(), 1) if b"last line" in line)
+    result = agent.run_tool("read_file", {"path": artifact["path"], "start": last_line, "end": last_line})
     assert "last line" in result
+
+
+def test_log_read_reports_exact_column_to_continue(tmp_path):
+    agent = build_agent(tmp_path, [])
+    line = "0123456789" * 115 + " tail detail"
+    artifact = agent.run_store.write_shell_output("run_page", line + "\nnext line", tmp_path)
+    args = {"path": artifact["path"], "start": 1, "end": 2}
+
+    page = agent.execute_tool("read_file", args)
+    assert page.metadata["artifact_read"]
+    assert len(page.content) < SHELL_LOG_READ_CHARS
+    first_line, continuation = page.content.splitlines()[1:]
+    match = re.search(r"line 1, column (\d+)", continuation)
+    assert match
+    column = int(match[1])
+    assert first_line.strip() == "1: " + line[:column - 1]
+
+    second = agent.execute_tool("read_file", {**args, "start_column": column})
+    assert second.content.splitlines()[1:] == ["   1: " + line[column - 1:], "   2: next line"]
+
+    (tmp_path / "normal.log").write_text(line, encoding="utf-8")
+    normal = agent.execute_tool("read_file", {"path": "normal.log"})
+    assert line in normal.content
+    assert not normal.metadata.get("artifact_read")
+
+
+def test_log_read_reports_budget_failure_before_sending_an_incomplete_prompt(tmp_path):
+    agent = build_agent(tmp_path, [])
+    artifact = agent.run_store.write_shell_output("run_budget", "x" * 1200, tmp_path)
+    agent.model_client = FakeModelClient([tool_call("read_file", path=artifact["path"])])
+    agent.context_manager = ContextManager(agent, total_budget=500)
+
+    with pytest.raises(RuntimeError, match="Prompt budget exceeded while reserving the latest log read"):
+        agent.ask("Read the log.")
+    assert len(agent.model_client.prompts) == 1
+    assert agent.last_prompt_metadata["history"]["artifact_read_chars"] > 500
 
 
 def test_artifact_limit_keeps_multibyte_output_valid(tmp_path):

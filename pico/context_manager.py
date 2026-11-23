@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from .context_budget import estimate_input_tokens, input_budget
 from .context_summary import render_summary
 from .features.memory import file_freshness
-from .run_store import tool_output_reference
+from .run_store import SHELL_LOG_READ_MARKER, tool_output_reference
 from .task_state import snapshot_fingerprint
 
 
@@ -166,27 +166,33 @@ class ContextManager:
 
         budgets = dict(self.section_budgets)
         reduction_log = []
+        log_read_chars = self._latest_log_read_chars(history)
+        history_minimum = len(HISTORY_HEADER) + log_read_chars
         if task_rows:
             # Give priority rows first use of the memory allocation, then borrow from history.
             reserved = max(protected_chars, min(task_chars, self.total_budget))
             extra = max(0, reserved - budgets["memory"])
             budgets["memory"] += extra
             before = budgets["history"]
-            budgets["history"] = min(before, max(len(HISTORY_HEADER), before - extra))
+            budgets["history"] = min(before, max(history_minimum, before - extra))
             if before != budgets["history"]:
                 reduction_log.append({
                     "section": "history", "before_chars": before,
                     "after_chars": budgets["history"], "reason": "task_state_reservation",
                 })
+        if log_read_chars:
+            budgets["history"] = max(budgets["history"], history_minimum)
         rendered = self._render_sections(section_texts, budgets, history, task_rows, selected_notes, summary)
         prompt = self._assemble_prompt(rendered)
         floors = dict(self.section_floors)
         if task_rows:
             floors["history"] = min(floors["history"], len(HISTORY_HEADER))
             floors["memory"] = max(floors["memory"], reserved)
+        if log_read_chars:
+            floors["history"] = max(floors["history"], history_minimum)
 
-        # Preserve task rows while other sections can shrink. In the last pass,
-        # only active constraints and the current request are mandatory.
+        # Let task rows give way to active constraints if the other sections
+        # cannot shrink further. Keep the latest log read on its delivery turn.
         while True:
             token_overflow = 0 if token_budget is None else estimate_input_tokens(prompt) - token_budget
             overflow = max(len(prompt) - self.total_budget, token_overflow)
@@ -370,6 +376,8 @@ class ContextManager:
             parts.append(f"read_file: {tool_output_reference(artifact)}")
         elif "detail" in evidence:
             parts.append(evidence["detail"])
+        if excerpt := evidence.get("log_excerpt"):
+            parts.append(f"log line {excerpt['line']}: {excerpt['text']}")
         return "".join(f" | {part}" for part in parts)
 
     @staticmethod
@@ -487,8 +495,12 @@ class ContextManager:
             history = self._prompt_history()
         header = HISTORY_HEADER
         covered = 0
+        log_read_chars = self._latest_log_read_chars(history)
         if summary_text := render_summary(summary, len(history)):
-            if len(summary_text) + 1 <= budget // 2:
+            summary_chars = len(summary_text) + 1
+            if (summary_chars <= budget // 2
+                and len(header) + summary_chars + log_read_chars <= budget
+                and (not log_read_chars or summary["covered_history_count"] < len(history))):
                 header += "\n" + summary_text
                 covered = summary["covered_history_count"]
                 history = history[covered:]
@@ -508,6 +520,8 @@ class ContextManager:
             "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
         }
+        if log_read_chars:
+            details["artifact_read_chars"] = log_read_chars
         fixed = self.history_strategy == "fixed"
         first_recent = max(0, len(history) - FIXED_HISTORY_WINDOW) if fixed else 0
         recent_start = len(history)
@@ -591,9 +605,16 @@ class ContextManager:
         entries = [self._render_history_item(item) for item in history]
         return "\n".join([HISTORY_HEADER, *(entries or ["- empty"])])
 
+    def _latest_log_read_chars(self, history):
+        if history and history[-1].get("artifact_read"):
+            return 1 + len(self._render_history_item(history[-1]))
+        return 0
+
     def _render_history_item(self, item):
         if item["role"] == "tool":
             content = item["content"]
+            if item.get("artifact_read"):
+                return SHELL_LOG_READ_MARKER + content
             if self._is_unversioned_read(item):
                 content = "Historical read (version unverified):\n" + content
             return f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}\n{content}"

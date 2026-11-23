@@ -1468,8 +1468,7 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
     ]
     checkpoint_events = [event for event in trace_events if event["event"] == "checkpoint_created"]
 
-    assert checkpoint_events
-    assert checkpoint_events[0]["trigger"] == "freshness_mismatch"
+    assert [event["trigger"] for event in checkpoint_events[:2]] == ["user_request", "freshness_mismatch"]
 
 
 def test_runtime_identity_persists_key_execution_metadata(tmp_path):

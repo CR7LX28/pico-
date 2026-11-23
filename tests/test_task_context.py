@@ -1,7 +1,10 @@
 import json
 import sys
 
+import pytest
+
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
+from pico.checkpoint import load_task_context
 from pico.context_manager import ContextManager
 
 
@@ -28,9 +31,84 @@ def priority_memory(prompt):
     return prompt.split("\n\nMemory:\n", 1)[1].split("\n\nRelevant memory:", 1)[0]
 
 
+def test_request_and_tool_event_are_saved_with_checkpoint_before_next_model_call(tmp_path, monkeypatch):
+    agent = build_agent(tmp_path, [tool("write_file", path="example.txt", content="example\n")])
+    session_id = agent.session["id"]
+    complete = agent.model_client.complete
+    save = agent.session_store.save
+    observed_roles = []
+
+    def check_session_write(session):
+        state = session["checkpoints"]
+        checkpoint = state["items"][state["current_id"]]
+        assert checkpoint["history_count"] == len(session["history"])
+        assert checkpoint["task_context"] == session["task_context"]
+        return save(session)
+
+    def interrupt_after_tool(*args, **kwargs):
+        saved = agent.session_store.load(session_id)
+        state = saved["checkpoints"]
+        checkpoint = state["items"][state["current_id"]]
+        assert checkpoint["history_count"] == len(saved["history"])
+        assert checkpoint["task_context"] == saved["task_context"]
+        observed_roles.append(saved["history"][-1]["role"])
+        if observed_roles[-1] == "tool":
+            assert "example.txt" in checkpoint["task_context"]["changes"]
+            raise KeyboardInterrupt
+        return complete(*args, **kwargs)
+
+    monkeypatch.setattr(agent.model_client, "complete", interrupt_after_tool)
+    monkeypatch.setattr(agent.session_store, "save", check_session_write)
+    with pytest.raises(KeyboardInterrupt):
+        agent.ask("Write an example. Do not change the public API.")
+
+    assert observed_roles == ["user", "tool"]
+    saved = agent.session_store.load(session_id)
+    saved["task_context"] = {}
+    save(saved)
+    resumed = build_agent(tmp_path, [], session_id)
+    task_context = load_task_context(resumed)
+    assert task_context.goal["text"] == "Write an example"
+    assert task_context.constraints["public-api-change"]["text"] == "Do not change the public API"
+    assert "example.txt" in task_context.changes
+
+
+def test_legacy_progress_and_stale_file_survive_interruption_after_request(tmp_path, monkeypatch):
+    path = tmp_path / "example.txt"
+    path.write_text("original\n", encoding="utf-8")
+    agent = build_agent(tmp_path, [tool("read_file", path="example.txt"), "<final>Read it.</final>"])
+    agent.ask("Inspect the example.")
+    session_id = agent.session["id"]
+    legacy_checkpoint = agent.current_checkpoint()
+    legacy_checkpoint.pop("history_count")
+    context = load_task_context(agent)
+    context.record_request("Do not delete tests.", {"history_index": len(agent.session["history"])})
+    agent.session["task_context"] = context.to_dict()
+    agent.record({"role": "user", "content": "Do not delete tests."})
+    path.write_text("edited externally\n", encoding="utf-8")
+
+    def interrupt_before_prompt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    resumed = build_agent(tmp_path, [], session_id)
+    monkeypatch.setattr(resumed.run_store, "start_run", interrupt_before_prompt)
+    with pytest.raises(KeyboardInterrupt):
+        resumed.ask("Continue. Do not change the public API.")
+
+    restarted = build_agent(tmp_path, [], session_id)
+    task_context = load_task_context(restarted)
+    assert set(task_context.constraints) == {"delete tests", "public-api-change"}
+    assert restarted.current_checkpoint()["resume_baseline_id"] == legacy_checkpoint["checkpoint_id"]
+    assert restarted.resume_state["status"] == "partial-stale"
+    assert restarted.resume_state["stale_paths"] == ["example.txt"]
+
+
 def test_task_context_survives_tools_and_resume_then_updates_from_evidence(tmp_path):
     target = tmp_path / "check.py"
-    target.write_text("print('obsolete-file-observation')\nprint('x' * 7000)\nraise SystemExit(2)\n", encoding="utf-8")
+    target.write_text(
+        "print('obsolete-file-observation')\nprint('x' * 7000)\nprint('ERROR: check failed')\nraise SystemExit(2)\n",
+        encoding="utf-8",
+    )
     command = f'"{sys.executable}" check.py'
     check = tool("run_shell", command=command)
     agent = build_agent(tmp_path, [
@@ -54,6 +132,7 @@ def test_task_context_survives_tools_and_resume_then_updates_from_evidence(tmp_p
     assert "不要修改公共 API" in memory
     assert "Unresolved error" in memory
     assert reference in memory
+    assert "log line 5: ERROR: check failed" in memory
 
     resumed = build_agent(tmp_path, ["<final>继续检查。</final>"], session_id)
     resumed.ask("继续")
@@ -77,6 +156,7 @@ def test_task_context_survives_tools_and_resume_then_updates_from_evidence(tmp_p
     assert "不要删除测试" in after
     assert "Unresolved error" in before
     assert "Unresolved error" not in after
+    assert "ERROR: check failed" not in after
     assert "Recorded verification" in after and "exit_code: 0" in after
     assert "Recorded change: check.py" in after
     progress = fixed.session["task_context"]

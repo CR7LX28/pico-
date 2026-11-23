@@ -192,14 +192,40 @@ def _read_file_range(context, args):
     return path, start, end, start_column
 
 
-def tool_read_file(context, args):
+def tool_read_file(context, args, *, max_chars=None):
     path, start, end, start_column = _read_file_range(context, args)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     selected = lines[start - 1:end]
     if selected:
         selected[0] = selected[0][start_column - 1:]
-    body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(selected, start=start))
-    return f"# {path.relative_to(context.root)}\n{body}"
+    header = f"# {path.relative_to(context.root)}\n"
+    rows = [f"{number:>4}: {line}" for number, line in enumerate(selected, start=start)]
+    content = header + "\n".join(rows)
+    if max_chars is None or len(content) <= max_chars:
+        return content
+
+    footer = "\nContinue read_file at line {}, column {} (keep the same end)."
+    last_line = start + len(rows) - 1
+    largest_column = start_column + max(map(len, selected), default=0)
+    remaining = max_chars - len(header) - len(footer.format(last_line, largest_column))
+    if remaining <= 0:
+        raise ValueError("Log read budget is too small for a fragment and its continuation.")
+    page = []
+    for number, row in enumerate(rows, start=start):
+        separator = 1 if page else 0
+        prefix_length = len(f"{number:>4}: ")
+        column = start_column if number == start else 1
+        if len(row) + separator <= remaining:
+            page.append(row)
+            remaining -= len(row) + separator
+            continue
+        fragment_length = remaining - separator - prefix_length
+        if fragment_length > 0:
+            page.append(row[:prefix_length + fragment_length])
+            column += fragment_length
+        if not page:
+            raise ValueError("Log read budget is too small for a fragment and its continuation.")
+        return header + "\n".join(page) + footer.format(number, column)
 
 
 def tool_search(context, args):

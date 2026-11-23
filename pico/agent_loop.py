@@ -21,6 +21,8 @@ class AgentLoop:
     def _prepare_prompt(self, task_state, user_message, *, notice=""):
         agent = self.agent
         prompt, metadata = agent._build_prompt_and_metadata(user_message, notice=notice)
+        if metadata["history"].get("artifact_read_chars"):
+            return prompt, metadata
         plan = plan_summary(agent, metadata)
         if plan is None:
             return prompt, metadata
@@ -111,6 +113,12 @@ class AgentLoop:
 
     def _request_model(self, task_state, user_message, prompt, prompt_metadata, run_started_at, purpose):
         agent = self.agent
+        if prompt_metadata["history"].get("artifact_read_chars") and prompt_metadata.get("prompt_over_budget"):
+            exc = RuntimeError("Prompt budget exceeded while reserving the latest log read.")
+            agent.last_completion_metadata = {}
+            agent.emit_trace(task_state, "log_read_budget_exceeded", {"purpose": purpose})
+            self._persist_model_failure(task_state, user_message, exc, run_started_at, prompt_metadata)
+            raise exc
         if prompt_metadata.get("context_window_exceeded"):
             estimated = prompt_metadata["input_tokens_estimated"]
             budget = prompt_metadata["input_budget_tokens"]
@@ -206,11 +214,13 @@ class AgentLoop:
         task_context = load_task_context(agent)
         source = {"run_id": task_state.run_id, "history_index": len(agent.session["history"])}
         task_context.record_request(user_message, source)
-        agent.session["task_context"] = task_context.to_dict()
         # 最新请求短文本与跨轮任务状态各自更新。
         agent.memory.set_task_summary(user_message)
-        agent.session["memory"] = agent.memory.to_dict()
-        agent.record({"role": "user", "content": user_message, "created_at": now()})
+        request_checkpoint = agent.create_checkpoint(
+            task_state, user_message, trigger="user_request",
+            event={"role": "user", "content": user_message, "created_at": now()},
+            task_context=task_context.to_dict(),
+        )
 
         # [4] 标记恢复状态（新 run 为 no-checkpoint，恢复时为 full-valid / partial-stale）
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
@@ -226,6 +236,10 @@ class AgentLoop:
                 "task_id": task_state.task_id,
                 "user_request": clip(user_message, 300),
             },
+        )
+        agent.emit_trace(
+            task_state, "checkpoint_created",
+            {"checkpoint_id": request_checkpoint["checkpoint_id"], "trigger": "user_request"},
         )
 
         tool_steps = 0
@@ -335,15 +349,18 @@ class AgentLoop:
                     item["tool_status"] = tool_result.metadata["tool_status"]
                 if "read_file_version" in tool_result.metadata:
                     item["read_file_version"] = tool_result.metadata["read_file_version"]
+                if tool_result.metadata.get("artifact_read"):
+                    item["artifact_read"] = True
                 source = {
                     "run_id": task_state.run_id,
                     "tool_step": task_state.tool_steps,
                     "history_index": len(agent.session["history"]),
                 }
                 task_context.record_tool(name, args, tool_result, source, agent.redact_text)
-                agent.session["task_context"] = task_context.to_dict()
-                agent.session["memory"] = agent.memory.to_dict()
-                agent.record(item)
+                checkpoint = agent.create_checkpoint(
+                    task_state, user_message, trigger="tool_executed", event=item,
+                    task_context=task_context.to_dict(),
+                )
                 # ② write_task_state → task_state.json：只更新计数（tool_steps / last_tool），给监控看
                 agent.run_store.write_task_state(task_state)
                 # ③ emit_trace → trace.jsonl：裁剪后摘要 + 耗时 + 工具元数据，给人排错看
@@ -356,9 +373,6 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),  # 工具返回的安全级别、错误码等
                     },
                 )
-                # 每次工具执行后都建一个检查点，方便中断恢复
-                checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
-                agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state, "checkpoint_created",
                     {"checkpoint_id": checkpoint["checkpoint_id"], "trigger": "tool_executed"},

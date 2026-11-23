@@ -11,6 +11,8 @@ from uuid import uuid4
 
 
 MAX_SHELL_ARTIFACT_BYTES = 256 * 1024
+SHELL_LOG_READ_CHARS = 800
+SHELL_LOG_READ_MARKER = "[tool:read_file]\n"
 SHELL_ARTIFACT_TRUNCATION = b"\n...[artifact truncated at byte limit; middle omitted]...\n"
 
 
@@ -32,6 +34,13 @@ class RunStore:
 
     def run_dir(self, run_id):
         return self.root / _run_id(run_id)
+
+    def is_shell_output(self, resolved_path):
+        root = self.root.resolve()
+        if not resolved_path.is_relative_to(root):
+            return False
+        parts = resolved_path.relative_to(root).parts
+        return len(parts) == 3 and parts[1] == "tool_outputs" and resolved_path.suffix == ".log"
 
     def task_state_path(self, run_id):
         return self.run_dir(run_id) / "task_state.json"

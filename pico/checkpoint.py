@@ -59,13 +59,24 @@ def current_checkpoint(agent):
     return state.get("items", {}).get(checkpoint_id)
 
 
+def _resume_checkpoint(agent):
+    checkpoint = current_checkpoint(agent)
+    if checkpoint is None or "resume_baseline_id" not in checkpoint:
+        return checkpoint
+    return checkpoint_state(agent)["items"].get(checkpoint["resume_baseline_id"])
+
+
 def load_task_context(agent):
-    if isinstance(saved := agent.session.get("task_context"), dict):
-        return TaskContext.from_dict(saved)
     checkpoint = current_checkpoint(agent) or {}
     compatible = checkpoint.get("schema_version") == CHECKPOINT_SCHEMA_VERSION
-    if compatible and isinstance(saved := checkpoint.get("task_context"), dict):
+    checkpoint_context = checkpoint.get("task_context") if compatible else None
+    if isinstance(checkpoint_context, dict) and "history_count" in checkpoint:
+        return TaskContext.from_dict(checkpoint_context)
+    # Older writers could save fresh task evidence before updating the checkpoint.
+    if isinstance(saved := agent.session.get("task_context"), dict):
         return TaskContext.from_dict(saved)
+    if isinstance(checkpoint_context, dict):
+        return TaskContext.from_dict(checkpoint_context)
     context = TaskContext()
     for index, item in enumerate(agent.session["history"]):
         if item["role"] == "user":
@@ -78,7 +89,7 @@ def load_task_context(agent):
 def evaluate_resume_state(agent):
     previous_resume_state = dict(agent.session.get("resume_state", {}) or {})
     invalidated = agent.invalidate_stale_memory()
-    checkpoint = current_checkpoint(agent)
+    checkpoint = _resume_checkpoint(agent)
     status = CHECKPOINT_NONE_STATUS
     stale_paths = list(invalidated)
     mismatch_fields = []
@@ -126,7 +137,7 @@ def evaluate_resume_state(agent):
 
 
 def render_checkpoint_text(agent):
-    checkpoint = current_checkpoint(agent)
+    checkpoint = _resume_checkpoint(agent)
     if not checkpoint:
         return ""
     lines = [
@@ -169,17 +180,36 @@ def infer_next_step(task_state):
     return "Continue the task from the latest checkpoint."
 
 
-def create_checkpoint(agent, task_state, user_message, trigger):
+def create_checkpoint(agent, task_state, user_message, trigger, *, event=None, task_context=None):
     state = checkpoint_state(agent)
     current = current_checkpoint(agent)
     checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
-    key_files = []
-    freshness = {}
-    for path in agent.memory.to_dict()["working"]["recent_files"]:
-        file_freshness = memorylib.file_freshness(path, agent.root)
-        freshness[path] = file_freshness
-        key_files.append({"path": path, "freshness": file_freshness})
-    task_context = deepcopy(agent.session.get("task_context", {}))
+    session = dict(agent.session)
+    memory = agent.memory.to_dict()
+    if event is not None:
+        session["history"] = [*session["history"], event]
+        session["memory"] = memory
+    if task_context is not None:
+        session["task_context"] = task_context
+    task_context = deepcopy(session.get("task_context", {}))
+
+    if trigger == "user_request":
+        # Save the new request without replacing the baseline used for freshness checks.
+        baseline = _resume_checkpoint(agent) or {}
+        if baseline.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            baseline = {}
+        key_files = baseline.get("key_files", [])
+        freshness = baseline.get("freshness", {})
+        runtime_identity = baseline.get("runtime_identity", {})
+    else:
+        key_files = [
+            {"path": path, "freshness": memorylib.file_freshness(path, agent.root)}
+            for path in memory["working"]["recent_files"]
+        ]
+        freshness = {item["path"]: item["freshness"] for item in key_files}
+        runtime_identity = current_runtime_identity(agent)
+        session["runtime_identity"] = runtime_identity
+
     checkpoint = {
         "checkpoint_id": checkpoint_id,
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
@@ -187,6 +217,7 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "created_at": now(),
         "current_goal": task_context.get("goal", {}).get("text", str(user_message)),
         "task_context": task_context,
+        "history_count": len(session["history"]),
         "completed": [task_state.final_answer] if task_state.final_answer else [],
         "excluded": [],
         "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),
@@ -194,11 +225,16 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "key_files": key_files,
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",
-        "runtime_identity": current_runtime_identity(agent),
+        "runtime_identity": runtime_identity,
     }
-    state["items"][checkpoint_id] = checkpoint
-    state["current_id"] = checkpoint_id
+    if trigger == "user_request":
+        checkpoint["resume_baseline_id"] = (current or {}).get("resume_baseline_id", state["current_id"])
+    session["checkpoints"] = {
+        **state,
+        "items": {**state["items"], checkpoint_id: checkpoint},
+        "current_id": checkpoint_id,
+    }
+    agent.session_path = agent.session_store.save(session)
+    agent.session.update(session)
     task_state.checkpoint_id = checkpoint_id
-    agent.session["runtime_identity"] = checkpoint["runtime_identity"]
-    agent.session_path = agent.session_store.save(agent.session)
     return checkpoint

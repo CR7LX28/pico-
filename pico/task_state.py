@@ -132,12 +132,22 @@ class TaskContext:
             evidence["workspace_snapshot"] = metadata["verification_snapshot"]
         if "read_file_version" in metadata:
             evidence["read_file_version"] = metadata["read_file_version"]
+        excerpt = metadata.get("log_excerpt")
+        if excerpt:
+            excerpt = {**excerpt, "text": redact(excerpt["text"])}
+        if metadata.get("artifact_read") and excerpt:
+            path = metadata["read_file_version"]["path"]
+            for error in self.open_errors.values():
+                if error.get("artifact", {}).get("path") == path:
+                    error["log_excerpt"] = excerpt
         if status == "ok":
             previous = self.open_errors.pop(key, None)
             if previous:
                 evidence["resolves"] = previous["source"]
         else:
             evidence["detail"] = clip(redact(result.content).replace("\n", " ").strip(), 160)
+            if excerpt:
+                evidence["log_excerpt"] = excerpt
             self.open_errors.pop(key, None)
             self.open_errors[key] = evidence
         if "exit_code" in evidence or "resolves" in evidence:
