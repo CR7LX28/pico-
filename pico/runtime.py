@@ -426,7 +426,6 @@ class Pico:
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
 

@@ -67,6 +67,25 @@ def test_file_summaries_use_canonical_paths_and_freshness(tmp_path):
     assert "sample.txt" not in memory.to_dict()["file_summaries"]
 
 
+def test_legacy_session_drops_file_preview_notes_and_preserves_findings(tmp_path):
+    (tmp_path / "sample.txt").write_text("sample content\n", encoding="utf-8")
+    memory = LayeredMemory(workspace_root=tmp_path)
+    memory.set_file_summary("sample.txt", "1: sample content")
+    state = memory.to_dict()
+    state["episodic_notes"] = [
+        {"text": "1: sample content", "source": "sample.txt", "tags": ["sample.txt"], "note_index": 4},
+        {"text": "Keep sample initialization", "source": "sample.txt", "tags": ["sample.txt"], "note_index": 3},
+    ]
+    state["notes"] = [note["text"] for note in state["episodic_notes"]]
+
+    resumed = LayeredMemory(state, workspace_root=tmp_path)
+    snapshot = resumed.to_dict()
+    assert snapshot["notes"] == ["Keep sample initialization"]
+    assert snapshot["next_note_index"] == 5
+    assert snapshot["file_summaries"]["sample.txt"]["summary"] == "1: sample content"
+    assert [note["text"] for note in resumed.retrieval_candidates("sample")] == ["Keep sample initialization"]
+
+
 def test_process_notes_keep_kind_and_latest_duplicate_wins():
     memory = LayeredMemory()
 

@@ -71,22 +71,20 @@ def test_agent_updates_task_summary_on_each_request(tmp_path):
     assert agent.session["memory"]["working"]["task_summary"] == "Second request"
 
 
-def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
+def test_agent_stores_read_previews_only_as_file_summaries(tmp_path):
     (tmp_path / "facts.txt").write_text("deploy key is red\n", encoding="utf-8")
     agent = build_agent(
         tmp_path,
         [
             '<tool>{"name":"read_file","args":{"path":"facts.txt","start":1,"end":1}}</tool>',
             "<final>Done.</final>",
-            "<final>It is red.</final>",
         ],
     )
 
     assert agent.ask("Read the file and remember the fact") == "Done."
-    notes = agent.session["memory"]["episodic_notes"]
-    assert any("deploy key is red" in note["text"] for note in notes)
-    assert not any(note["text"] == "Done." for note in notes)
-    assert not any(note["text"] == "Done." for note in notes)
+    memory = agent.session["memory"]
+    assert memory["episodic_notes"] == []
+    assert "deploy key is red" in memory["file_summaries"]["facts.txt"]["summary"]
 
     resumed = Pico.from_session(
         model_client=FakeModelClient(["<final>It is red.</final>"]),
@@ -98,8 +96,9 @@ def test_agent_only_stores_reusable_epistemic_notes(tmp_path):
 
     assert resumed.ask("What color is the deploy key?") == "It is red."
     prompt = resumed.model_client.prompts[-1]
-    assert "Relevant memory" in prompt
-    assert "deploy key is red" in prompt
+    memory_section, relevant_section = prompt.split("Relevant memory:\n", 1)
+    assert "deploy key is red" in memory_section.split("Memory:\n", 1)[1]
+    assert "deploy key is red" not in relevant_section.split("\n\nTranscript:", 1)[0]
 
 
 def test_file_summary_cache_is_invalidated_on_out_of_band_edit_and_path_spelling(tmp_path):

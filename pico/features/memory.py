@@ -383,7 +383,6 @@ def normalize_memory_state(state, workspace_root=None):
             normalized_notes.append(_normalize_note(note, index))
         episodic_notes = normalized_notes
     episodic_notes = episodic_notes[-EPISODIC_NOTE_LIMIT:]
-    state["episodic_notes"] = episodic_notes
 
     file_summaries = state.get("file_summaries")
     if not isinstance(file_summaries, dict):
@@ -415,6 +414,18 @@ def normalize_memory_state(state, workspace_root=None):
     max_index = max([note["note_index"] for note in episodic_notes], default=-1)
     state["next_note_index"] = max(next_note_index, max_index + 1)
 
+    # Older versions duplicated read_file previews as notes with a path-only tag.
+    episodic_notes = [
+        note
+        for note in episodic_notes
+        if not (
+            note["kind"] == "episodic"
+            and note["source"]
+            and note["tags"] == [note["source"]]
+            and (note["text"] == "(empty)" or re.match(r"\d+:", note["text"]))
+        )
+    ]
+    state["episodic_notes"] = episodic_notes
     state["task"] = working["task_summary"]
     state["files"] = list(working["recent_files"])
     state["notes"] = [note["text"] for note in episodic_notes]
@@ -523,16 +534,6 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
     for note in state["episodic_notes"]:
         # 召回逻辑故意保持简单透明：先看 tag 精确命中，
         # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
-        source = note["source"]
-        if note["kind"] == "episodic" and source and note["tags"] == [source]:
-            # read_file also saves a file summary. Recall only the matching,
-            # current copy of the file observation.
-            summary = state["file_summaries"].get(source, {})
-            if (
-                note["text"] != summary.get("summary")
-                or summary.get("freshness") != file_freshness(source, workspace_root)
-            ):
-                continue
         note_tags = {tag.lower() for tag in note.get("tags", [])}
         note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
         exact_tag_match = int(bool(query_tokens & note_tags))
